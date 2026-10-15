@@ -29,14 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// BGPRouteManager allows to manage the routes announced by the BGP server.
-type BGPRouteManager interface {
-	AddHost(ctx context.Context, addr string, object string) error
-	DelHost(ctx context.Context, addr string, object string) error
-}
-
-func (cluster *Cluster) StartVipService(ctx context.Context, c *kubevip.Config, em *election.Manager,
-	bgpServer BGPRouteManager, killFunc func()) error {
+func (cluster *Cluster) StartVipService(ctx context.Context, c *kubevip.Config, em *election.Manager, bgpServer bgp.BGPManager, killFunc func()) error {
 
 	var err error
 
@@ -51,6 +44,9 @@ func (cluster *Cluster) StartVipService(ctx context.Context, c *kubevip.Config, 
 	loadbalancers := []*loadbalancer.IPVSLoadBalancer{}
 
 	for i := range cluster.Network {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		network := cluster.Network[i]
 
 		if network.IsDDNS() {
@@ -287,7 +283,28 @@ func (cluster *Cluster) StartVipService(ctx context.Context, c *kubevip.Config, 
 	return nil
 }
 
-func (cluster *Cluster) bgpHealthCheckLoop(ctx context.Context, c *kubevip.Config, bgpServer BGPRouteManager, vipCIDR string) {
+func (cluster *Cluster) bgpHealthCheck(ctx context.Context, c *kubevip.Config) (bool, error) {
+	statusCode := 0
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ControlPlaneHealthCheck.Address, nil)
+	if err != nil {
+		return false, fmt.Errorf("building request %v: %w", req, err)
+	} else {
+		resp, err := cluster.healthCheckHTTPClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("checking control-plane: %w", err)
+		}
+		defer resp.Body.Close()
+		statusCode = resp.StatusCode
+	}
+	healthy := statusCode == http.StatusOK
+	if !healthy {
+		return healthy, fmt.Errorf("wrong status code: %d", statusCode)
+	}
+	return healthy, nil
+}
+
+func (cluster *Cluster) bgpHealthCheckLoop(ctx context.Context, c *kubevip.Config, bgpServer bgp.BGPManager, vipCIDR string) {
 	period := time.Duration(c.ControlPlaneHealthCheck.PeriodSeconds) * time.Second
 
 	consecutiveFailures := 0
@@ -304,24 +321,7 @@ func (cluster *Cluster) bgpHealthCheckLoop(ctx context.Context, c *kubevip.Confi
 	)
 
 	for {
-		statusCode := 0
-		var healthErr error
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ControlPlaneHealthCheck.Address, nil)
-		if err != nil {
-			healthErr = err
-		} else {
-			resp, err := cluster.healthCheckHTTPClient.Do(req)
-			if err != nil {
-				healthErr = err
-			} else {
-				defer resp.Body.Close()
-				statusCode = resp.StatusCode
-			}
-		}
-
-		healthy := healthErr == nil && statusCode == http.StatusOK
-
+		healthy, healthErr := cluster.bgpHealthCheck(ctx, c)
 		if healthy {
 			consecutiveFailures = 0
 			if !routeAnnounced {
@@ -336,10 +336,7 @@ func (cluster *Cluster) bgpHealthCheckLoop(ctx context.Context, c *kubevip.Confi
 			consecutiveFailures++
 			if healthErr != nil {
 				log.Warn("BGP health check failed", "address", c.ControlPlaneHealthCheck.Address, "consecutive", consecutiveFailures, "err", healthErr)
-			} else {
-				log.Warn("BGP health check failed", "address", c.ControlPlaneHealthCheck.Address, "consecutive", consecutiveFailures, "status", statusCode)
 			}
-
 			if consecutiveFailures >= c.ControlPlaneHealthCheck.FailureThreshold && routeAnnounced {
 				log.Warn("BGP health check threshold reached, withdrawing route", "failureThreshold", c.ControlPlaneHealthCheck.FailureThreshold, "cidr", vipCIDR)
 				if err := bgpServer.DelHost(ctx, vipCIDR, c.NodeName); err != nil {
@@ -399,16 +396,59 @@ func getNodeIPs(ctx context.Context, nodename string, client *kubernetes.Clients
 }
 
 // StartLoadBalancerService will start a VIP instance and leave it for kube-proxy to handle
-func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip.Config, bgp *bgp.Server, name string, wg *sync.WaitGroup) error {
+func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip.Config, bgp bgp.BGPManager, name string, wg *sync.WaitGroup) error {
 	// use a Go context so we can tell the arp loop code when we
 	// want to step down
 	//nolint
 	lbCtx, lbCancel := context.WithCancel(ctx)
-
 	var lbWg sync.WaitGroup
+	stop, done, err := cluster.startServicesWorker()
+	if err != nil {
+		lbCancel()
+		return err
+	}
+	type startedNetwork struct {
+		network    vip.Network
+		routeAdded bool
+		ipAdded    bool
+		bgpAdded   bool
+	}
+	startedNetworks := make([]startedNetwork, 0, len(cluster.Network))
+	servicesWorkerStarted := false
+	defer func() {
+		if !servicesWorkerStarted {
+			lbCancel()
+			lbWg.Wait()
+			cleanupCtx := context.WithoutCancel(ctx)
+			for index := len(startedNetworks) - 1; index >= 0; index-- {
+				started := startedNetworks[index]
+				if started.bgpAdded && bgp != nil {
+					if err := bgp.DelHost(cleanupCtx, started.network.CIDR(), name); err != nil {
+						log.Warn("failed to withdraw BGP host after startup failure", "address", started.network.CIDR(), "err", err)
+					}
+				}
+				if started.routeAdded && cluster.routeMgr != nil {
+					if err := cluster.routeMgr.Delete(name, started.network); err != nil {
+						log.Warn("failed to delete route after startup failure", "address", started.network.CIDR(), "err", err)
+					}
+				}
+				if started.ipAdded {
+					if _, err := started.network.DeleteIP(); err != nil {
+						log.Warn("failed to delete VIP after startup failure", "address", started.network.IP(), "err", err)
+					}
+				}
+			}
+			cluster.finishServicesWorker(done)
+		}
+	}()
 
 	for i := range cluster.Network {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		network := cluster.Network[i]
+		startedNetworks = append(startedNetworks, startedNetwork{network: network})
+		started := &startedNetworks[len(startedNetworks)-1]
 
 		if network.IsDDNS() {
 			ddnsReady := make(chan struct{})
@@ -431,9 +471,10 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 			lbCancel()
 			return utils.WrapPanicError(err, "failed to set mask for subnet %q", c.VIPSubnet)
 		}
-		_, err := network.DeleteIP()
+		existing, err := network.IsSet()
 		if err != nil {
-			log.Warn("attempted to clean existing VIP", "err", err)
+			lbCancel()
+			return fmt.Errorf("check existing VIP %q: %w", network.IP(), err)
 		}
 		log.Debug("config flags", "enable_routing_table", c.EnableRoutingTable, "enable_leader_election", c.EnableLeaderElection, "enable_services_election", c.EnableServicesElection)
 
@@ -442,6 +483,7 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 			if err != nil {
 				log.Warn(err.Error())
 			} else {
+				started.routeAdded = true
 				log.Info("successful add Route")
 			}
 		}
@@ -450,8 +492,10 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 			// Normal VIP addition, use skipDAD=false for normal DAD process
 			// Note: When WireGuard is enabled, the VIP is added to the tunnel interface
 			// instead of lo, so we skip adding it here.
-			if _, err = network.AddIP(false, false); err != nil {
-				log.Warn(err.Error())
+			added, addErr := network.AddIP(false, false)
+			started.ipAdded = existing == nil && added
+			if addErr != nil {
+				log.Warn(addErr.Error())
 			} else {
 				log.Info("successful add IP", "address", network.IP())
 			}
@@ -469,11 +513,14 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 			err = bgp.AddHost(lbCtx, network.CIDR(), name)
 			if err != nil {
 				log.Error(err.Error())
+			} else {
+				started.bgpAdded = true
 			}
 		}
 	}
 
 	wg.Go(func() {
+		defer cluster.finishServicesWorker(done)
 		for i := range cluster.Network {
 			network := cluster.Network[i]
 
@@ -488,7 +535,7 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 		}
 
 		select {
-		case <-cluster.stop:
+		case <-stop:
 		case <-ctx.Done():
 		}
 
@@ -509,8 +556,9 @@ func (cluster *Cluster) StartLoadBalancerService(ctx context.Context, c *kubevip
 			return
 		}
 
-		cluster.cleanupVIPs(c)
+		cluster.cleanupServiceVIPs(c, done)
 	})
+	servicesWorkerStarted = true
 
 	return nil
 }

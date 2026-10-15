@@ -32,7 +32,6 @@ import (
 	"github.com/kube-vip/kube-vip/pkg/upnp"
 	"github.com/kube-vip/kube-vip/pkg/utils"
 	"github.com/kube-vip/kube-vip/pkg/vip"
-	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -56,10 +55,6 @@ type Manager struct {
 	sigint sync.Once
 
 	svcProcessor *services.Processor
-
-	// This is a prometheus counter used to count the number of events received
-	// from the service watcher
-	countServiceWatchEvent *prometheus.CounterVec
 
 	// This mutex is to protect calls from various goroutines
 	mutex sync.Mutex
@@ -255,20 +250,17 @@ func New(ctx context.Context, configMap string, config *kubevip.Config) (*Manage
 	leaseMgr := lease.NewManager()
 	routeMgr := route.NewManager()
 
-	svcProcessor := services.NewServicesProcessor(config, bgpServer, clientset, rwClientSet,
+	svcProcessor, err := services.NewServicesProcessor(config, bgpServer, clientset, rwClientSet,
 		intfMgr, arpMgr, nodeLabelManager, electionMgr, leaseMgr, routeMgr)
+	if err != nil {
+		return nil, fmt.Errorf("creating services processor: %w", err)
+	}
 
 	return &Manager{
-		clientSet:   clientset,
-		rwClientSet: rwClientSet,
-		configMap:   configMap,
-		config:      config,
-		countServiceWatchEvent: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "kube_vip",
-			Subsystem: "manager",
-			Name:      "all_services_events",
-			Help:      "Count all events fired by the service watcher categorised by event type",
-		}, []string{"type"}),
+		clientSet:        clientset,
+		rwClientSet:      rwClientSet,
+		configMap:        configMap,
+		config:           config,
 		signalChan:       signalChan,
 		svcProcessor:     svcProcessor,
 		intfMgr:          intfMgr,
@@ -291,14 +283,8 @@ func (sm *Manager) Start(ctx context.Context) error {
 		if sm.config.HealthCheckPort < 1024 {
 			return fmt.Errorf("healthcheck port is using a port that is less than 1024 [%d]", sm.config.HealthCheckPort)
 		}
-		http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-			fmt.Fprintf(w, "OK")
-		})
+		server := newHealthServer(sm.config.HealthCheckPort)
 		wg.Go(func() {
-			server := &http.Server{
-				Addr:              fmt.Sprintf(":%d", sm.config.HealthCheckPort),
-				ReadHeaderTimeout: 3 * time.Second,
-			}
 			err := server.ListenAndServe()
 			if err != nil {
 				log.Error("healthcheck", "unable to start", err)
@@ -339,6 +325,20 @@ func (sm *Manager) Start(ctx context.Context) error {
 	return sm.startMode(ctx)
 }
 
+// newHealthServer builds the healthcheck server with unique mux.
+func newHealthServer(port int) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "OK")
+	})
+
+	return &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+}
+
 // Start will begin the Manager, which will start services and watch the configmap
 func (sm *Manager) startMode(ctx context.Context) error {
 	var cpCluster *cluster.Cluster
@@ -353,8 +353,8 @@ func (sm *Manager) startMode(ctx context.Context) error {
 	wg := sync.WaitGroup{}
 	modeCtx, cancel := context.WithCancel(ctx)
 	defer func() {
-
 		wg.Wait()
+		sm.svcProcessor.WaitForElectionCampaigns()
 		w.Cleanup()
 		cancel()
 		log.Info("Shutting down Kube-Vip")
@@ -429,7 +429,12 @@ func (sm *Manager) startMode(ctx context.Context) error {
 
 func (sm *Manager) waitForShutdown(ctx context.Context, cancel context.CancelFunc, cpCluster *cluster.Cluster) {
 	for {
-		sig := <-sm.signalChan
+		var sig os.Signal
+		select {
+		case <-ctx.Done():
+			return
+		case sig = <-sm.signalChan:
+		}
 		switch sig {
 		case syscall.SIGUSR1:
 			log.Info("Received SIGUSR1, dumping configuration")
