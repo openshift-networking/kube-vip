@@ -59,7 +59,7 @@ func NewManager(config *kubevip.Config, k8sClientset, rwClientset *kubernetes.Cl
 func RunOrDie(ctx context.Context, run *RunConfig, c *kubevip.Config) error {
 	switch c.LeaderElectionType {
 	case "kubernetes", "":
-		runKubernetesLeaderElectionOrDie(ctx, run)
+		return runKubernetesLeaderElectionOrDie(ctx, run)
 	case "etcd":
 		if err := runEtcdLeaderElectionOrDie(ctx, run); err != nil {
 			return err
@@ -71,20 +71,28 @@ func RunOrDie(ctx context.Context, run *RunConfig, c *kubevip.Config) error {
 	return nil
 }
 
-func runKubernetesLeaderElectionOrDie(ctx context.Context, run *RunConfig) {
+func runKubernetesLeaderElectionOrDie(ctx context.Context, run *RunConfig) error {
+	annotationProvider := func() (map[string]string, error) {
+		vips := run.VIPs
+		if run.VIPsProvider != nil {
+			vips = run.VIPsProvider()
+		}
+		return kubevip.WithLeaseVIPs(run.LeaseAnnotations, run.Config.InstanceName, run.Config.RoutingProtocol, vips)
+	}
+	leaseClient := run.Mgr.KubernetesClient.CoordinationV1().Leases(run.LeaseID.Namespace())
 	// we use the Lease lock type since edits to Leases are less common
 	// and fewer objects in the cluster watch "all Leases".
-	lock := &resourcelock.LeaseLock{
+	baseLock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:        run.LeaseID.Name(),
-			Namespace:   run.LeaseID.Namespace(),
-			Annotations: run.LeaseAnnotations,
+			Name:      run.LeaseID.Name(),
+			Namespace: run.LeaseID.Namespace(),
 		},
 		Client: run.Mgr.KubernetesClient.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
 			Identity: run.Config.NodeName,
 		},
 	}
+	lock := newAnnotatedLeaseLockWithProvider(baseLock, leaseClient, run.LeaseID.Name(), annotationProvider)
 
 	// start the leader election code loop
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
@@ -105,6 +113,7 @@ func runKubernetesLeaderElectionOrDie(ctx context.Context, run *RunConfig) {
 			OnNewLeader:      run.OnNewLeader,
 		},
 	})
+	return nil
 }
 
 func runEtcdLeaderElectionOrDie(ctx context.Context, run *RunConfig) error {
@@ -135,6 +144,8 @@ type RunConfig struct {
 	LeaseID          lease.ID
 	Mgr              *Manager
 	LeaseAnnotations map[string]string
+	VIPs             []string
+	VIPsProvider     func() []string
 
 	// onStartedLeading is called when this member starts leading.
 	OnStartedLeading func(context.Context)
@@ -161,9 +172,9 @@ func (em *Manager) NodeWatcher(ctx context.Context, lb *loadbalancer.IPVSLoadBal
 	defer watchCancel()
 
 	rw, err := watchtools.NewRetryWatcherWithContext(watchCtx, "1", &cache.ListWatch{
-		WatchFunc: func(_ metav1.ListOptions) (watch.Interface, error) {
-			return utils.WatchWithAuthRetry(ctx, func(ctx context.Context) (watch.Interface, error) {
-				return em.RetryWatcherClient.CoreV1().Nodes().Watch(watchCtx, listOptions)
+		WatchFuncWithContext: func(retryCtx context.Context, _ metav1.ListOptions) (watch.Interface, error) {
+			return utils.WatchWithAuthRetry(retryCtx, func(ctx context.Context) (watch.Interface, error) {
+				return em.RetryWatcherClient.CoreV1().Nodes().Watch(ctx, listOptions)
 			})
 		},
 	})

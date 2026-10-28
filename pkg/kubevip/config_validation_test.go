@@ -3,6 +3,8 @@ package kubevip
 import (
 	"strings"
 	"testing"
+
+	"github.com/kube-vip/kube-vip/pkg/metrics"
 )
 
 func TestValidate_HealthCheckAddress(t *testing.T) {
@@ -32,6 +34,30 @@ func TestValidate_HealthCheckAddress(t *testing.T) {
 	}
 }
 
+func TestValidate_Pprof(t *testing.T) {
+	tests := []struct {
+		name        string
+		enablePprof bool
+		addr        string
+		wantErr     bool
+	}{
+		{name: "disabled without address"},
+		{name: "disabled with address", addr: "127.0.0.1:6060"},
+		{name: "enabled with address", enablePprof: true, addr: "127.0.0.1:6060"},
+		{name: "enabled with default address", enablePprof: true, addr: metrics.DefaultPprofHTTPServer},
+		{name: "enabled without address", enablePprof: true, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := &Config{EnablePprof: test.enablePprof, PprofHTTPServer: test.addr}
+			if err := config.Validate(); (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_InstanceName(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -54,6 +80,30 @@ func TestValidate_InstanceName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := &Config{InstanceName: tt.instanceName}
+			err := config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_RoutingProtocol(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol int
+		wantErr  bool
+	}{
+		{name: "unset", protocol: 0, wantErr: false},
+		{name: "kube-vip default", protocol: 248, wantErr: false},
+		{name: "maximum byte value", protocol: 255, wantErr: false},
+		{name: "truncated on the wire", protocol: 256, wantErr: true},
+		{name: "negative", protocol: -1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{RoutingProtocol: tt.protocol}
 			err := config.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Validate() error = %v, wantErr %t", err, tt.wantErr)

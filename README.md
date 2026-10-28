@@ -20,6 +20,23 @@ The idea behind `kube-vip` is a small self-contained Highly-Available option for
 
 For upgrading an existing install in place (static Pod or DaemonSet), see the [upgrade guide](https://kube-vip.io/docs/upgrade/).
 
+### Runtime configuration files
+
+The `manager` and `service` commands accept strict YAML or JSON configuration
+with `--config-file PATH` or the `config_file` environment variable. Values are
+resolved in this order: explicitly supplied CLI flags, environment variables,
+configuration file, then command defaults. An explicitly supplied `false`, `0`,
+or empty string overrides lower-priority sources; an omitted value does not.
+`--config-file` takes precedence over `config_file` when both are set.
+
+Configuration keys use the documented external names (for example `enableARP`,
+`dnsDualStackMode`, and `bgpConfig.routerID`). Unknown keys are rejected. Runtime-
+derived `isDualStack` and `requireDualStack`, the bootstrap `configFile` key, and
+generator-only `loadBalancers`, `bgpPeers`, `singleNode`, `startAsLeader`, and
+`addPeersAsBackends` keys are intentionally not accepted in runtime files.
+Use `bgpConfig.peers` for BGP peers; the legacy single `bgpPeerConfig` form is
+also accepted and normalized into the runtime peer list.
+
 ## Features
 
 Kube-Vip was originally created to provide a HA solution for the Kubernetes control plane, over time it has evolved to incorporate that same functionality into Kubernetes service type [load-balancers](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer).
@@ -86,6 +103,40 @@ ip_vs_rr
 
 Preloading only the required modules is preferred to enabling the SELinux
 `domain_kernel_load_modules` boolean for containers.
+
+### Metrics and profiling
+
+kube-vip runs two independent observability HTTP servers. Metrics are on by
+default and profiling is off.
+
+#### Metrics endpoint
+
+Metrics are exposed on `:2112` by default, configurable with
+`--prometheusHTTPServer` or `prometheus_server`. An empty value disables the
+server.
+
+Exposed metrics cover service reconciliation events and errors, leader election
+transitions, BGP session state and build info (version, build, node).
+
+#### pprof endpoints (debug only)
+
+Profiling can be enabled with `--enablePprof` CLI flag or `enable_pprof` env variable, and listens on
+`127.0.0.1:6060` by default. The addrees can be configured with `--pprofHTTPServer` or
+`pprof_server`.
+
+```yaml
+# Kubernetes manifest
+containers:
+  - name: kube-vip
+    env:
+      - name: enable_pprof
+        value: "true"
+      - name: pprof_server
+        value: "127.0.0.1:1234"
+```
+
+Profiles available under `/debug/pprof/`: `profile` (CPU), `heap`, `allocs`,
+`goroutine`, `threadcreate`, `trace`, `cmdline` and `symbol`. 
 
 ### Gateway API `LoadBalancer` services with no endpoints
 
