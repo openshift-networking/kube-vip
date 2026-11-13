@@ -5,7 +5,7 @@ TARGET := kube-vip
 .DEFAULT_GOAL := $(TARGET)
 
 # These will be provided to the target
-VERSION := v1.2.3
+VERSION := v1.3.1
 
 BUILD := `git rev-parse HEAD`
 
@@ -16,21 +16,17 @@ TARGETOS=linux
 LDFLAGS=-ldflags "-s -w -X=main.Version=$(VERSION) -X=main.Build=$(BUILD) -extldflags -static"
 DOCKERTAG ?= $(VERSION)
 REPOSITORY ?= docker.io/plndr
-GO_VERSION := 1.26.6
+GO_VERSION := $(word 2,$(shell grep '^go ' go.mod))
 K8S_VERSION ?= v1.35.0
 GINKGO_ARGS ?=
 GINKGO_PROCS ?=
 GINKGO_PARALLEL := $(if $(GINKGO_PROCS),--procs=$(GINKGO_PROCS),-p)
 BUILDX_CACHE_FLAGS ?=
+# Platforms that release binaries are built for, matching the published container images (linux/arm is ARMv7)
+RELEASE_PLATFORMS ?= linux/amd64 linux/arm64 linux/arm linux/ppc64le linux/s390x
+RELEASE_DIR ?= dist
 
-# Module mode for the test targets. Some CI builder images (e.g. the OpenShift
-# ART golang builder) export GOFLAGS=-mod=vendor, which breaks `go test` in this
-# non-vendored repository. Override it on the test recipes so the tests resolve
-# modules from the cache instead of a non-existent vendor/ directory.
-# Use override so an inherited GOFLAGS from the environment cannot win.
-override TEST_GOFLAGS := -mod=mod
-
-.PHONY: all build clean install uninstall simplify check run e2e-tests unit-tests integration-tests unit-tests-docker integration-tests-docker
+.PHONY: all build clean install uninstall release-binaries simplify check run e2e-tests unit-tests integration-tests unit-tests-docker integration-tests-docker e2e-tests-etcd
 
 all: check install
 
@@ -42,6 +38,7 @@ build: $(TARGET)
 
 clean:
 	@rm -f $(TARGET)
+	@rm -rf $(RELEASE_DIR)
 
 install:
 	@echo Building and Installing project
@@ -49,6 +46,19 @@ install:
 
 uninstall: clean
 	@rm -f $$(which ${TARGET})
+
+# Build a static binary named $(TARGET)-<os>-<arch> for every platform in RELEASE_PLATFORMS,
+# plus a SHA-256 checksum file covering them, into RELEASE_DIR
+release-binaries:
+	@rm -rf $(RELEASE_DIR)
+	@mkdir -p $(RELEASE_DIR)
+	@for platform in $(RELEASE_PLATFORMS); do \
+		os=$${platform%%/*}; arch=$${platform#*/}; \
+		echo "Building $(TARGET) $(VERSION) for $$os/$$arch"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch GOARM=7 go build -trimpath $(LDFLAGS) -o $(RELEASE_DIR)/$(TARGET)-$$os-$$arch || exit 1; \
+	done
+	@cd $(RELEASE_DIR) && sha256sum $(TARGET)-* > $(TARGET)-checksums.txt
+	@echo Release binaries written to $(RELEASE_DIR)
 
 demo:
 	@cd demo
@@ -140,13 +150,13 @@ manifest-test:
 	docker run $(REPOSITORY)/$(TARGET):$(DOCKERTAG) manifest daemonset --interface eth0 --vip 192.168.0.1 --image "$(REPOSITORY)/$(TARGET):$(DOCKERTAG)" --bgp --leaderElection --controlplane --services --inCluster
 
 unit-tests:
-	GOFLAGS="$(TEST_GOFLAGS)" go test -race ./...
+	go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
 unit-tests-docker:
 	docker run --rm -w /kube-vip -v $$(pwd):/kube-vip -v kube-vip-gomod-cache:/go/pkg/mod -v kube-vip-gobuild-cache:/root/.cache/go-build golang:$(GO_VERSION) sh -c "make unit-tests; status=$$?; chmod 666 coverage.out 2>/dev/null || true; exit $$status"
 
 integration-tests:
-	GOFLAGS="$(TEST_GOFLAGS)" go test -tags=integration,e2e -v ./pkg/etcd
+	go test -tags=integration,e2e -v ./pkg/etcd
 
 e2e-tests-arp: get-whoami
 	GOMAXPROCS=4 TEST_MODE=arp K8S_IMAGE_PATH=kindest/node:$(K8S_VERSION) E2E_IMAGE_PATH=$(REPOSITORY)/$(TARGET):$(DOCKERTAG) go run github.com/onsi/ginkgo/v2/ginkgo --tags=e2e -v $(GINKGO_PARALLEL) $(GINKGO_ARGS) ./testing/e2e
@@ -156,6 +166,9 @@ e2e-tests-rt: get-whoami
 
 e2e-tests-bgp: get-whoami get-gobgp
 	GOMAXPROCS=4 TEST_MODE=bgp K8S_IMAGE_PATH=kindest/node:$(K8S_VERSION) E2E_IMAGE_PATH=$(REPOSITORY)/$(TARGET):$(DOCKERTAG) go run github.com/onsi/ginkgo/v2/ginkgo --tags=e2e -v $(GINKGO_PARALLEL) $(GINKGO_ARGS) ./testing/e2e
+
+e2e-tests-etcd: get-whoami
+	GOMAXPROCS=4 K8S_IMAGE_PATH=kindest/node:$(K8S_VERSION) E2E_IMAGE_PATH=$(REPOSITORY)/$(TARGET):$(DOCKERTAG) go run github.com/onsi/ginkgo/v2/ginkgo --tags=e2e -v $(GINKGO_PARALLEL) $(GINKGO_ARGS) ./testing/e2e/etcd
 
 e2e-tests: e2e-tests-arp e2e-tests-rt e2e-tests-bgp
 

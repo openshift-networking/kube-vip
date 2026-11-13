@@ -20,6 +20,123 @@ The idea behind `kube-vip` is a small self-contained Highly-Available option for
 
 For upgrading an existing install in place (static Pod or DaemonSet), see the [upgrade guide](https://kube-vip.io/docs/upgrade/).
 
+### Running kube-vip as a binary
+
+[GitHub releases](https://github.com/kube-vip/kube-vip/releases) have
+statically linked Linux binaries attached for `amd64`, `arm64`, `arm` (ARMv7),
+`ppc64le` and `s390x`, named `kube-vip-linux-<arch>`, along with a
+`kube-vip-checksums.txt` file holding their SHA-256 checksums. They let
+kube-vip run directly on a host, for example as a systemd service next to
+control plane components that are themselves deployed as binaries.
+
+```shell
+VERSION=vX.Y.Z # the release to install
+ARCH=amd64
+curl -fsSLO "https://github.com/kube-vip/kube-vip/releases/download/${VERSION}/kube-vip-linux-${ARCH}"
+curl -fsSLO "https://github.com/kube-vip/kube-vip/releases/download/${VERSION}/kube-vip-checksums.txt"
+sha256sum --check --ignore-missing kube-vip-checksums.txt
+sudo install -m 0755 "kube-vip-linux-${ARCH}" /usr/local/bin/kube-vip
+```
+
+The binary accepts the same flags and environment variables as the container
+image. Run it as root (or with `CAP_NET_ADMIN` and `CAP_NET_RAW`) so it can
+manage addresses and send ARP. It reads `/etc/kubernetes/admin.conf` by
+default, and `--autodetectcp` makes it reach the API server running on the same
+host instead of the VIP it is about to bring up. To use a different kubeconfig,
+set `--k8sConfigPath` and put the local API server address in the
+`kubernetes_addr` environment variable. A minimal control plane VIP in ARP mode
+as a systemd unit:
+
+```ini
+[Unit]
+Description=kube-vip
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kube-vip manager --interface eth0 --address 192.168.0.40 \
+    --controlplane --arp --leaderElection --autodetectcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`make release-binaries` builds the same set of binaries locally into `dist/`.
+
+### Verifying release artifacts
+
+Container images and release binaries are signed keylessly with
+[cosign](https://docs.sigstore.dev/cosign/overview/) using the GitHub Actions
+OIDC identity. Release images and binaries also have a signed SLSA build
+provenance attestation available through the GitHub attestation API, and each
+image has a signed CycloneDX SBOM attestation in the registry.
+
+Signatures and SBOM attestations are attached in both the current Sigstore
+bundle format and the legacy cosign format, so cosign v3 (recommended) and
+cosign v2 can verify the same artifacts.
+
+For images published by a release (`ghcr.io/kube-vip/kube-vip:<version>`,
+`plndr/kube-vip:<version>`, and the corresponding `kube-vip-iptables` images):
+
+```shell
+VERSION=vX.Y.Z # the release to verify
+
+cosign verify "ghcr.io/kube-vip/kube-vip:${VERSION}" \
+  --certificate-identity-regexp '^https://github\.com/kube-vip/kube-vip/\.github/workflows/release\.yaml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+cosign verify-attestation --type cyclonedx "ghcr.io/kube-vip/kube-vip:${VERSION}" \
+  --certificate-identity-regexp '^https://github\.com/kube-vip/kube-vip/\.github/workflows/release\.yaml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+gh attestation verify "oci://ghcr.io/kube-vip/kube-vip:${VERSION}" --repo kube-vip/kube-vip
+```
+
+The same cosign commands work with the Docker Hub names (`plndr/kube-vip`,
+`plndr/kube-vip-iptables`).
+
+Nightly images built from `main` are signed by `.github/workflows/main.yaml`;
+use the same commands with the `main` tag and this identity:
+
+```shell
+cosign verify ghcr.io/kube-vip/kube-vip:main \
+  --certificate-identity https://github.com/kube-vip/kube-vip/.github/workflows/main.yaml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Release binaries are covered by `kube-vip-checksums.txt`. Verify the checksums
+signature before trusting the hashes, then check the provenance of an
+individual binary:
+
+```shell
+cosign verify-blob kube-vip-checksums.txt \
+  --bundle kube-vip-checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/kube-vip/kube-vip/\.github/workflows/release-binaries\.yaml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --check --ignore-missing kube-vip-checksums.txt
+
+gh attestation verify kube-vip-linux-amd64 --repo kube-vip/kube-vip
+```
+
+### Runtime configuration files
+
+The `manager` and `service` commands accept strict YAML or JSON configuration
+with `--config-file PATH` or the `config_file` environment variable. Values are
+resolved in this order: explicitly supplied CLI flags, environment variables,
+configuration file, then command defaults. An explicitly supplied `false`, `0`,
+or empty string overrides lower-priority sources; an omitted value does not.
+`--config-file` takes precedence over `config_file` when both are set.
+
+Configuration keys use the documented external names (for example `enableARP`,
+`dnsDualStackMode`, and `bgpConfig.routerID`). Unknown keys are rejected. Runtime-
+derived `isDualStack` and `requireDualStack`, the bootstrap `configFile` key, and
+generator-only `loadBalancers`, `bgpPeers`, `singleNode`, `startAsLeader`, and
+`addPeersAsBackends` keys are intentionally not accepted in runtime files.
+Use `bgpConfig.peers` for BGP peers; the legacy single `bgpPeerConfig` form is
+also accepted and normalized into the runtime peer list.
+
 ## Features
 
 Kube-Vip was originally created to provide a HA solution for the Kubernetes control plane, over time it has evolved to incorporate that same functionality into Kubernetes service type [load-balancers](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer).
@@ -87,6 +204,40 @@ ip_vs_rr
 Preloading only the required modules is preferred to enabling the SELinux
 `domain_kernel_load_modules` boolean for containers.
 
+### Metrics and profiling
+
+kube-vip runs two independent observability HTTP servers. Metrics are on by
+default and profiling is off.
+
+#### Metrics endpoint
+
+Metrics are exposed on `:2112` by default, configurable with
+`--prometheusHTTPServer` or `prometheus_server`. An empty value disables the
+server.
+
+Exposed metrics cover service reconciliation events and errors, leader election
+transitions, BGP session state and build info (version, build, node).
+
+#### pprof endpoints (debug only)
+
+Profiling can be enabled with `--enablePprof` CLI flag or `enable_pprof` env variable, and listens on
+`127.0.0.1:6060` by default. The address can be configured with `--pprofHTTPServer` or
+`pprof_server`.
+
+```yaml
+# Kubernetes manifest
+containers:
+  - name: kube-vip
+    env:
+      - name: enable_pprof
+        value: "true"
+      - name: pprof_server
+        value: "127.0.0.1:1234"
+```
+
+Profiles available under `/debug/pprof/`: `profile` (CPU), `heap`, `allocs`,
+`goroutine`, `threadcreate`, `trace`, `cmdline` and `symbol`. 
+
 ### Gateway API `LoadBalancer` services with no endpoints
 
 Some Gateway API controllers create `LoadBalancer` services that intentionally have no Endpoints/EndpointSlices backends.
@@ -119,7 +270,7 @@ Thanks for taking the time to join our community and start contributing! We welc
 
 :warning: This project has issue compiling on MacOS, please compile it on linux distribution
 
-Additionally it is now relatively easy and quick to develop with [skaffold](https://skaffold.dev/), and the `skaffold.yaml` exists within the root folder of the gir repository.
+Additionally it is now relatively easy and quick to develop with [skaffold](https://skaffold.dev/), and the `skaffold.yaml` exists within the root folder of the git repository.
 
 ### Set up a kind development environment
 

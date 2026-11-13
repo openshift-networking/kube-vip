@@ -77,6 +77,9 @@ const (
 	// Name of the service lease object
 	ServiceLease = "kube-vip.io/leaseName"
 
+	// Versioned kube-vip ownership metadata stored on Kubernetes election Leases
+	LeaseVIPs = "kube-vip.io/lease-vips"
+
 	// Forces kube-vip to use per service election for this particular service
 	ForcePerServiceElection = "kube-vip.io/forcePerServiceElection"
 
@@ -91,4 +94,8 @@ const (
 
 	// Set the BROADCAST flag in DHCP DISCOVER/REQUEST packets
 	DHCPBroadcast = "kube-vip.io/dhcp-broadcast"
+
+	// Vendor class identifier (DHCP option 60) sent by the DHCPv4 client, so the
+	// DHCP server can assign the LoadBalancer address from a specific pool
+	DHCPVendorClass = "kube-vip.io/dhcp-vendor-class"
 )

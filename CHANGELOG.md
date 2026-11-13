@@ -8,15 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Use non-terminating EndpointSlice endpoints that are ready but not serving, so Services with `publishNotReadyAddresses` keep their endpoints under both `Local` and `Cluster` traffic policies instead of blocking workloads that need the Service to become ready. Fixes #1833.
+- Skip the shared-VIP admission check for DHCP placeholder addresses (`0.0.0.0` and `::`), so independent DHCP Services are no longer rejected as sharing a VIP. Fixes #1835.
+- Clear the active egress endpoint during a zero-endpoint transition so restoring the same endpoint triggers egress reconciliation. Fixes #1830.
+- Treat `kube-vip.io/egress-detect-api-server: "false"` as disabled instead of adding the API server address to the egress denied networks.
+- Create distinct anonymous nftables destination-port sets for each egress allowed-network rule, preventing `EBUSY` when multiple allowed networks and destination ports are combined. Fixes #1804.
+- Use host scope for local routing-table routes so Linux accepts IPv4 `RTN_LOCAL` routes without assigning the VIP to an interface.
+- Make `manager` and `service` runtime configuration presence-aware, with explicit CLI flags taking precedence over environment variables, configuration files, and defaults. Strict YAML/JSON loading now preserves explicit false, zero, and empty values and normalizes standalone BGP peer configuration for runtime use.
 - Propagate `bgp_attach_ip_to_interface` into per-service config so it attaches BGP-mode Service VIPs to the interface as configured.
 - Add a configurable kube-vip instance name and use it to isolate internal nftables egress tables, persist table ownership on Services, and migrate per-Service chains without affecting other deployments. Fixes #1634.
 - Retry on 403 Forbidden and 401 Unauthorized in `ServicesWatcher` at startup with exponential backoff. Fixes #1464.
 - Reintroduce BGP config via node annotations. Fixes #1488.
 - Fail fast in runtime `manager` and `service` paths when legacy `vip_address` is used without `vip_subnet` in control-plane ARP, BGP, or Routing Table mode.
 - Cancel the mode context on init or configuration failure before waiting on goroutines during shutdown.
+- Join dual-stack Service addresses with `_` instead of `,` in the `service-provided.kube-vip.io` node label so the label value is valid and node labeling no longer causes Service lease churn. Fixes #1793.
+- Shut down the `health_check_port` server when the manager stops, so a node that loses leadership exits and restarts instead of hanging with `/healthz` still answering OK.
+- Write the `--tableID`, `--tableType`, `--routingProtocol` and `--cleanRoutingTable` settings into the generated manifest in routing table mode instead of leaving the defaults in place.
+- Write the `--multihop`, `--bgpHoldTimer`, `--bgpKeepAliveInterval` and Zebra (`--zebra`, `--zebraUrl`, `--zebraVersion`, `--zebraSoftwareName`) settings into the generated manifest in BGP mode instead of dropping them, which left the pod peering single-hop with the default timers and without Zebra. Fixes #1844.
+- Write the `--lbClassName` and `--lbClassNameLegacyHandling` settings into the generated manifest in services mode instead of dropping them, which left the pod watching Services of the default load balancer class with legacy class handling. Rename the misspelled `--loseLeadershiptTimeoutSeconds` flag to `--loseLeadershipTimeoutSeconds`, keeping the old name as a deprecated alias.
 
 
 ### Added
+- `kube-vip.io/dhcp-vendor-class` Service annotation to send a vendor class identifier (DHCP option 60) when kube-vip requests a DHCPv4 address for the Service, so the DHCP server can hand out LoadBalancer addresses from a dedicated pool. Fixes #411.
+  - The vendor class, and the host name and client identifier set by `kube-vip.io/loadbalancerHostname`, are also sent when the lease is renewed, so servers that match leases by client identifier or pools by vendor class keep renewing the same address
+- Static Linux binaries attached to GitHub releases for running kube-vip outside a container. Fixes #706.
+  - A new `Attach binaries to GitHub releases` workflow runs when a release is published (or manually for an existing tag) and uploads `kube-vip-linux-<arch>` for `amd64`, `arm64`, `arm` (ARMv7), `ppc64le` and `s390x`, plus a `kube-vip-checksums.txt` SHA-256 file
+  - The binaries are built by the new `make release-binaries` target, which writes them to `dist/` and stamps them with the release tag
+  - README documents downloading, verifying and running the binary as a systemd service
 - Configurable control-plane health check for BGP mode without leader election
   - Polls a configurable HTTP(S) endpoint (e.g. `https://localhost:6443/livez`) to verify the exposed service is healthy (usually the local kube-apiserver)
   - Withdraws the BGP route after a configurable number of consecutive failures, removing the unhealthy node from the ECMP set

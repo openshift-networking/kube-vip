@@ -104,21 +104,18 @@ func (sm *Manager) dumpServicesSection(ctx context.Context) {
 		fmt.Printf("Service Security Enabled: %t\n", sm.config.EnableServiceSecurity)
 
 		if sm.svcProcessor != nil {
-			instances := sm.svcProcessor.ServiceInstances
-			fmt.Printf("Kube-vip Active Service Instances: %d\n", len(instances))
-			for i, inst := range instances {
-				if inst.ServiceSnapshot != nil {
-					svc := inst.ServiceSnapshot
-					vipConfigs := ""
-					for j, cfg := range svc.Status.LoadBalancer.Ingress {
-						if j > 0 {
-							vipConfigs += ", "
-						}
-						vipConfigs += cfg.IP
+			services := sm.svcProcessor.ServiceSnapshots()
+			fmt.Printf("Kube-vip Active Service Instances: %d\n", len(services))
+			for i, svc := range services {
+				vipConfigs := ""
+				for j, cfg := range svc.Status.LoadBalancer.Ingress {
+					if j > 0 {
+						vipConfigs += ", "
 					}
-					fmt.Printf("  Service %d: %s/%s (Type: %s, VIPs: %s)\n",
-						i+1, svc.Namespace, svc.Name, svc.Spec.Type, vipConfigs)
+					vipConfigs += cfg.IP
 				}
+				fmt.Printf("  Service %d: %s/%s (Type: %s, VIPs: %s)\n",
+					i+1, svc.Namespace, svc.Name, svc.Spec.Type, vipConfigs)
 			}
 		}
 		if sm.clientSet != nil {
@@ -214,6 +211,10 @@ func (sm *Manager) dumpRuntimeSection() {
 		fmt.Printf("Load Balancers Configured: %d\n", len(sm.config.LoadBalancers))
 	}
 	fmt.Printf("Prometheus HTTP Server: %s\n", sm.config.PrometheusHTTPServer)
+	fmt.Printf("pprof Enabled: %t\n", sm.config.EnablePprof)
+	if sm.config.EnablePprof {
+		fmt.Printf("pprof HTTP Server: %s\n", sm.config.PprofHTTPServer)
+	}
 	fmt.Printf("Health Check Port: %d\n", sm.config.HealthCheckPort)
 	fmt.Printf("UPNP Enabled: %t\n", sm.config.EnableUPNP)
 	fmt.Printf("Egress Clean Enabled: %t\n", sm.config.EgressClean)
