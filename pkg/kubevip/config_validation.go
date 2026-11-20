@@ -2,6 +2,7 @@ package kubevip
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 )
@@ -18,13 +19,46 @@ const (
 // Validate runs configuration checks that are independent of host state.
 // This should be called after all config sources (flags, file, env vars) are merged.
 func (c *Config) Validate() error {
+	if c.LogFormat != "" && c.LogFormat != "text" && c.LogFormat != "json" {
+		return fmt.Errorf("logFormat %q is invalid, expected text or json", c.LogFormat)
+	}
+	if c.LogTimestampFormat != "" && c.LogTimestampFormat != "rfc3339" && c.LogTimestampFormat != "unix-ms" {
+		return fmt.Errorf("logTimestampFormat %q is invalid, expected rfc3339 or unix-ms", c.LogTimestampFormat)
+	}
 	if err := validateHealthCheckAddress(c.ControlPlaneHealthCheck.Address); err != nil {
 		return err
 	}
 	if err := validateInstanceName(c.InstanceName); err != nil {
 		return err
 	}
+	if err := validateRoutingProtocol(c.RoutingProtocol); err != nil {
+		return err
+	}
+	if err := validatePprof(c.EnablePprof, c.PprofHTTPServer); err != nil {
+		return err
+	}
+	if _, _, err := c.BGPConfig.BMP.Parse(); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// validatePprof rejects profiling being enabled with nowhere to serve it.
+func validatePprof(enabled bool, addr string) error {
+	if enabled && addr == "" {
+		return fmt.Errorf("pprof is enabled but no pprof server address is set")
+	}
+	return nil
+}
+
+// validateRoutingProtocol rejects values the kernel cannot represent: netlink
+// carries the address and route protocol in a single byte, so a larger value is
+// silently truncated on the wire and never matches on readback.
+func validateRoutingProtocol(protocol int) error {
+	if protocol < 0 || protocol > math.MaxUint8 {
+		return fmt.Errorf("routingProtocol %d is out of range, must be between 0 and %d", protocol, math.MaxUint8)
+	}
 	return nil
 }
 

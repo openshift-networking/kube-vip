@@ -4,18 +4,16 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	log "log/slog"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
@@ -58,6 +56,10 @@ var kubeVipCmd = &cobra.Command{
 }
 
 func init() {
+	// Defaults without a corresponding flag must exist before lower-priority
+	// configuration sources are overlaid.
+	initConfig.ArpBroadcastRate = 3000
+
 	// Basic flags
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.Interface, "interface", "", "Name of the interface to bind to")
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.ServicesInterface, "serviceInterface", "", "Name of the interface to bind to (for services)")
@@ -74,7 +76,10 @@ func init() {
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.EnableRoutingTable, "table", false, "Enable Routing Table for services VIPs")
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.PreserveVIPOnLeadershipLoss, "preserveVipOnLeadershipLoss", false, "Preserve ARP VIP addresses on interface when leadership is lost (default: false for backward compatibility)")
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.LoseLeadership, "loseLeadership", false, "Lose leadership when VIP interface goes down")
+	kubeVipCmd.PersistentFlags().IntVar(&initConfig.LoseLeadershipTimeoutSeconds, "loseLeadershipTimeoutSeconds", 30, "Timeout before re-electing a leader when the VIP interface is down")
+	// Keep accepting the original, misspelled flag name so existing command lines continue to work
 	kubeVipCmd.PersistentFlags().IntVar(&initConfig.LoseLeadershipTimeoutSeconds, "loseLeadershiptTimeoutSeconds", 30, "Timeout before re-electing a leader when the VIP interface is down")
+	_ = kubeVipCmd.PersistentFlags().MarkDeprecated("loseLeadershiptTimeoutSeconds", "use --loseLeadershipTimeoutSeconds instead")
 
 	// LoadBalancer flags
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.EnableLoadBalancer, "enableLoadBalancer", false, "enable loadbalancing on the VIP with IPVS")
@@ -111,6 +116,9 @@ func init() {
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.BGPConfig.Zebra.URL, "zebraUrl", "unix:/var/run/frr/zserv.api", "Path to the unix domain socket for connecting to Zebra daemon")
 	kubeVipCmd.PersistentFlags().Uint32Var(&initConfig.BGPConfig.Zebra.Version, "zebraVersion", 6, "Zebra API Version")
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.BGPConfig.Zebra.SoftwareName, "zebraSoftwareName", "frr8.3", "Software Name for Zebra")
+	kubeVipCmd.PersistentFlags().StringSliceVar(&initConfig.BGPConfig.BMP.Servers, "bgpBmpServers", []string{}, "Comma separated BGP Monitoring Protocol (BMP) stations to report BGP peers and routes to, format: <IPv4 address>[:<port>] or [<IPv6 address>][:<port>] (default port 11019)")
+	kubeVipCmd.PersistentFlags().StringVar(&initConfig.BGPConfig.BMP.Policy, "bgpBmpPolicy", kubevip.BMPPolicyLocalRIB, "BMP route monitoring policy: pre-policy, post-policy, local-rib (the routes kube-vip advertises) or all")
+	kubeVipCmd.PersistentFlags().Uint16Var(&initConfig.BGPConfig.BMP.StatisticsTimeout, "bgpBmpStatisticsTimeout", 0, "Interval in seconds between BMP Statistics Reports, between 15 and 65535 (0 disables them)")
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.ControlPlaneHealthCheck.Address, "controlPlaneHealthCheckAddress", "", "URL to poll for the control-plane health check when using BGP without leader election")
 	kubeVipCmd.PersistentFlags().IntVar(&initConfig.ControlPlaneHealthCheck.PeriodSeconds, "controlPlaneHealthCheckPeriodSeconds", 5, "Seconds between control-plane health checks")
 	kubeVipCmd.PersistentFlags().IntVar(&initConfig.ControlPlaneHealthCheck.TimeoutSeconds, "controlPlaneHealthCheckTimeoutSeconds", 3, "Timeout for each control-plane health check request")
@@ -122,6 +130,8 @@ func init() {
 
 	// Manage logging
 	kubeVipCmd.PersistentFlags().Int32Var(&initConfig.Logging, "log", 0, "Set the level of logging")
+	kubeVipCmd.PersistentFlags().StringVar(&initConfig.LogFormat, "logFormat", "text", "Log output format (text or json)")
+	kubeVipCmd.PersistentFlags().StringVar(&initConfig.LogTimestampFormat, "logTimestampFormat", "rfc3339", "JSON log timestamp format (rfc3339 or unix-ms; ignored for text logs)")
 
 	// Service flags
 	kubeVipService.Flags().StringVarP(&configMap, "configMap", "c", "plndr", "The configuration map defined within the cluster")
@@ -146,7 +156,7 @@ func init() {
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.EnableNodeLabeling, "enableNodeLabeling", false, fmt.Sprintf("Enable leader node labeling with %q, defaults to false", kubevip.HasIP))
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.ServicesLeaseName, "servicesLeaseName", "plndr-svcs-lock", "Name of the lease that is used for leader election for services (in arp mode)")
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.DNSMode, "dnsMode", "first", "Name of the mode that DNS lookup will be performed (first, ipv4, ipv6, dual)")
-	kubeVipCmd.PersistentFlags().StringVar(&initConfig.DHCPMode, "dhcpMode", "", "Mode DHCP resolving will use to obtain IP addresses (ipv4, ipv6, dual)")
+	kubeVipCmd.PersistentFlags().StringVar(&initConfig.DHCPMode, "dhcpMode", strings.ToLower(utils.IPv4Family), "Mode DHCP resolving will use to obtain IP addresses (ipv4, ipv6, dual)")
 	kubeVipCmd.PersistentFlags().UintVar(&initConfig.DHCPBackoffAttempts, "dhcpBackoffAttempts", kubevip.DefaultDHCPBackoffAttempts,
 		fmt.Sprintf("number of times DHCP client will try to obtain an IP address (defaults to: %d, 0 for unlimited retries)", kubevip.DefaultDHCPBackoffAttempts))
 	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.DisableServiceUpdates, "disableServiceUpdates", false, "If true, kube-vip will process services as usual, but will not update service's Status.LoadBalancer.Ingress slice")
@@ -158,6 +168,11 @@ func init() {
 
 	// Prometheus HTTP Server
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.PrometheusHTTPServer, "prometheusHTTPServer", ":2112", "Host and port used to expose Prometheus metrics via an HTTP server")
+
+	// pprof HTTP Server
+	kubeVipCmd.PersistentFlags().BoolVar(&initConfig.EnablePprof, "enablePprof", false, "Expose the pprof profiling endpoints (debug only, they are unauthenticated)")
+	kubeVipCmd.PersistentFlags().StringVar(&initConfig.PprofHTTPServer, "pprofHTTPServer", metrics.DefaultPprofHTTPServer,
+		"Host and port used to expose the pprof endpoints, only used with --enablePprof")
 
 	// Etcd
 	kubeVipCmd.PersistentFlags().StringVar(&initConfig.Etcd.CAFile, "etcdCACert", "", "Verify certificates of TLS-enabled secure servers using this CA bundle file")
@@ -224,19 +239,11 @@ var kubeVipService = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error { //nolint TODO
 		cmd.SilenceUsage = true
 
-		// Load configuration from file if specified (lowest priority)
-		if initConfig.ConfigFile != "" {
-			err := kubevip.MergeConfigFromFile(&initConfig, initConfig.ConfigFile)
-			if err != nil {
-				return fmt.Errorf("loading config file: %w", err)
-			}
+		if err := loadRuntimeConfig(cmd); err != nil {
+			return err
 		}
-
-		// parse environment variables, these will overwrite anything loaded from config file
-		err := kubevip.ParseEnvironment(&initConfig)
-		if err != nil {
-			return fmt.Errorf("parsing environment: %w", err)
-		}
+		configureLogging(&initConfig)
+		var err error
 		if err := initConfig.Validate(); err != nil {
 			return fmt.Errorf("validating configuration: %w", err)
 		}
@@ -245,9 +252,6 @@ var kubeVipService = &cobra.Command{
 		if initConfig.RoutingProtocol == unix.RTN_UNSPEC {
 			initConfig.RoutingProtocol = unix.RTN_UNICAST
 		}
-
-		// Set the logging level for all subsequent functions
-		log.SetLogLoggerLevel(log.Level(initConfig.Logging))
 
 		if err := initConfig.CheckInterface(); err != nil {
 			return fmt.Errorf("checking interface: %w", err)
@@ -299,19 +303,11 @@ var kubeVipManager = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error { //nolint TODO
 		cmd.SilenceUsage = true
 
-		// Load configuration from file if specified (lowest priority)
-		if initConfig.ConfigFile != "" {
-			err := kubevip.MergeConfigFromFile(&initConfig, initConfig.ConfigFile)
-			if err != nil {
-				return fmt.Errorf("loading config file: %w", err)
-			}
+		if err := loadRuntimeConfig(cmd); err != nil {
+			return err
 		}
-
-		// parse environment variables, these will overwrite anything loaded from config file
-		err := kubevip.ParseEnvironment(&initConfig)
-		if err != nil {
-			return fmt.Errorf("parsing environment: %w", err)
-		}
+		configureLogging(&initConfig)
+		var err error
 		if err := initConfig.Validate(); err != nil {
 			return fmt.Errorf("validating configuration: %w", err)
 		}
@@ -320,9 +316,6 @@ var kubeVipManager = &cobra.Command{
 		if initConfig.RoutingProtocol == unix.RTN_UNSPEC {
 			initConfig.RoutingProtocol = unix.RTN_UNICAST
 		}
-
-		// Set the logging level for all subsequent functions
-		log.SetLogLoggerLevel(log.Level(initConfig.Logging))
 
 		// Legacy vip_address requires vip_subnet for control-plane ARP, BGP, and Routing Table modes.
 		if initConfig.EnableControlPlane &&
@@ -347,15 +340,32 @@ var kubeVipManager = &cobra.Command{
 		defer wg.Wait()
 
 		// create main manager context
-		ctx, cancel := context.WithCancel(cmd.Context())
-		defer cancel()
+		ctx, cancel := context.WithCancelCause(cmd.Context())
+		defer cancel(nil)
+
+		metrics.RegisterPrometheusMetrics()
 
 		// start prometheus server
 		if initConfig.PrometheusHTTPServer != "" {
 			wg.Go(func() {
-				servePrometheusHTTPServer(ctx, PrometheusHTTPServerConfig{
+				if err := metrics.Serve(ctx, metrics.ServerConfig{
 					Addr: initConfig.PrometheusHTTPServer,
-				})
+				}); err != nil {
+					// Continue even if metrics server fails
+					log.Error("prometheus HTTP server", "err", err)
+				}
+			})
+		}
+
+		// start pprof server
+		if initConfig.EnablePprof {
+			wg.Go(func() {
+				if err := metrics.ServePprof(ctx, metrics.ServerConfig{
+					Addr: initConfig.PprofHTTPServer,
+				}); err != nil {
+					// Continue even if pprof server fails
+					log.Error("pprof HTTP server", "err", err)
+				}
 			})
 		}
 
@@ -449,9 +459,8 @@ var kubeVipManager = &cobra.Command{
 
 				wg.Go(func() {
 					if err := vip.MonitorDefaultInterface(ctx, defaultIF); err != nil {
-
 						log.Error("interface monitor", "err", err)
-						return
+						cancel(err)
 					}
 				})
 			}
@@ -473,7 +482,8 @@ var kubeVipManager = &cobra.Command{
 			return fmt.Errorf("new manager: %w", err)
 		}
 
-		metrics.RegisterPrometheusMetrics()
+		// Label metrics after the call to manager.New, as it may modify the node name
+		// if it was not set in the configuration.
 		metrics.BuildInfo.WithLabelValues(Release.Version, Release.Build, initConfig.NodeName)
 
 		// Start the service manager, this will watch the config Map and construct kube-vip services for it
@@ -485,63 +495,68 @@ var kubeVipManager = &cobra.Command{
 	},
 }
 
-// PrometheusHTTPServerConfig defines the Prometheus server configuration.
-type PrometheusHTTPServerConfig struct {
-	// Addr sets the http server address used to expose the metric endpoint
-	Addr string
-}
-
-func servePrometheusHTTPServer(ctx context.Context, config PrometheusHTTPServerConfig) {
-	var err error
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { //nolint TODO
-		_, _ = w.Write([]byte(`<html>
-			<head><title>kube-vip</title></head>
-			<body>
-			<h1>kube-vip Metrics</h1>
-			<p><a href="` + "/metrics" + `">Metrics</a></p>
-			</body>
-			</html>`))
-	})
-
-	srv := &http.Server{
-		Addr:              config.Addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 2 * time.Second,
-	}
-
-	wg := sync.WaitGroup{}
-
-	wg.Go(func() {
-		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error("prometheus HTTP server", "err", err)
+// loadRuntimeConfig applies defaults < file < environment < explicitly changed
+// flags. Flag values are captured before lower-priority sources mutate their
+// bound fields and then restored through pflag's normal parsers.
+func loadRuntimeConfig(cmd *cobra.Command) error {
+	changed := map[string]string{}
+	changedSlices := map[string][]string{}
+	cmd.Flags().Visit(func(flag *pflag.Flag) {
+		if value, ok := flag.Value.(pflag.SliceValue); ok {
+			changedSlices[flag.Name] = slices.Clone(value.GetSlice())
 			return
 		}
+		changed[flag.Name] = flag.Value.String()
 	})
 
-	log.Info("prometheus HTTP server started")
-
-	<-ctx.Done()
-
-	// create prometheus shutdown context (independent of other contexts)
-	ctxShutDown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer func() {
-		cancel()
-	}()
-
-	if err = srv.Shutdown(ctxShutDown); err != nil {
-		log.Error("shutting down prometheus HTTP server", "err", err)
-		return
+	configPath := initConfig.ConfigFile
+	if value, ok := os.LookupEnv("config_file"); ok {
+		configPath = value
 	}
-
-	if err == http.ErrServerClosed {
-		err = nil
+	if value, ok := changed["config-file"]; ok {
+		configPath = value
 	}
-
-	log.Info("prometheus HTTP server stopped")
-
-	wg.Wait()
+	if configPath != "" {
+		if _, flagSet := changed["dhcpMode"]; !flagSet {
+			if _, envSet := os.LookupEnv("vip_dhcp_mode"); !envSet {
+				initConfig.DHCPMode = ""
+			}
+		}
+		if err := kubevip.MergeConfigFromFile(&initConfig, configPath); err != nil {
+			return fmt.Errorf("loading config file: %w", err)
+		}
+	}
+	if err := kubevip.ParseEnvironment(&initConfig); err != nil {
+		return fmt.Errorf("parsing environment: %w", err)
+	}
+	for name, value := range changed {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			return fmt.Errorf("restoring --%s: %w", name, err)
+		}
+	}
+	for name, value := range changedSlices {
+		flag := cmd.Flags().Lookup(name)
+		if err := flag.Value.(pflag.SliceValue).Replace(value); err != nil {
+			return fmt.Errorf("restoring --%s: %w", name, err)
+		}
+	}
+	changedBGPPeers, bgpPeersChanged := changedSlices["bgppeers"]
+	if bgpPeersChanged && strings.Join(changedBGPPeers, "") == "" {
+		initConfig.BGPPeers = changedBGPPeers
+		initConfig.BGPConfig.Peers = nil
+	} else if bgpPeersChanged {
+		initConfig.BGPPeers = changedBGPPeers
+		peers, err := kubevip.ParseBGPPeerConfig(strings.Join(initConfig.BGPPeers, ","))
+		if err != nil {
+			return fmt.Errorf("parsing --bgppeers: %w", err)
+		}
+		initConfig.BGPConfig.Peers = peers
+	}
+	if initConfig.BGPPeerConfig.Address != "" {
+		initConfig.BGPConfig.Peers = []kubevip.BGPPeer{initConfig.BGPPeerConfig}
+	}
+	initConfig.ConfigFile = configPath
+	return nil
 }
 
 func GenerateCidrRange(address string, dnsMode string) (string, error) {
