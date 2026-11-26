@@ -10,6 +10,9 @@ const (
 	// The host that has the VIP
 	VipHost = "kube-vip.io/vipHost"
 
+	// BGPForwardingNode advertises a ready endpoint's node as the VIP next hop.
+	BGPForwardingNode = "kube-vip.io/bgp-forwarding-node"
+
 	// Enable Egress on a service
 	Egress = "kube-vip.io/egress"
 
@@ -77,6 +80,9 @@ const (
 	// Name of the service lease object
 	ServiceLease = "kube-vip.io/leaseName"
 
+	// Versioned kube-vip ownership metadata stored on Kubernetes election Leases
+	LeaseVIPs = "kube-vip.io/lease-vips"
+
 	// Forces kube-vip to use per service election for this particular service
 	ForcePerServiceElection = "kube-vip.io/forcePerServiceElection"
 
@@ -91,4 +97,14 @@ const (
 
 	// Set the BROADCAST flag in DHCP DISCOVER/REQUEST packets
 	DHCPBroadcast = "kube-vip.io/dhcp-broadcast"
+
+	// Vendor class identifier (DHCP option 60) sent by the DHCPv4 client, so the
+	// DHCP server can assign the LoadBalancer address from a specific pool. The
+	// DHCPv6 client sends it in the Vendor Class option (16) when
+	// DHCPVendorClassEnterpriseNumber is also set
+	DHCPVendorClass = "kube-vip.io/dhcp-vendor-class"
+
+	// IANA Private Enterprise Number that the DHCPv6 client sends with the
+	// vendor class in the Vendor Class option (16)
+	DHCPVendorClassEnterpriseNumber = "kube-vip.io/dhcp-vendor-class-enterprise-number"
 )

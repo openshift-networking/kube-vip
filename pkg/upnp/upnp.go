@@ -13,7 +13,7 @@ import (
 
 // The UPNP library is structured a bit funny. To create a forward on a gateway and know
 // the external IP of that gateway we need two different instances of the UPNP client
-// WANIPv6FirewallControlClient can be empty if the gatway doesn't support the WANIPv6FirewallControl service
+// WANIPv6FirewallControlClient can be empty if the gateway doesn't support the WANIPv6FirewallControl service
 type Gateway struct {
 	ConnectionClient             ConnectionClient
 	WANIPv6FirewallControlClient *internetgateway2.WANIPv6FirewallControl1
@@ -38,6 +38,57 @@ type ConnectionClient interface {
 	GetServiceClient() *goupnp.ServiceClient
 }
 
+type contextPortMapper interface {
+	AddPortMappingCtx(
+		ctx context.Context,
+		remoteHost string,
+		externalPort uint16,
+		protocol string,
+		internalPort uint16,
+		internalClient string,
+		enabled bool,
+		description string,
+		leaseDuration uint32,
+	) error
+}
+
+type contextAddressGetter interface {
+	GetExternalIPAddressCtx(ctx context.Context) (string, error)
+}
+
+// AddPortMapping adds a forwarding rule with cancellation when the client supports it.
+func AddPortMapping(
+	ctx context.Context,
+	client ConnectionClient,
+	remoteHost string,
+	externalPort uint16,
+	protocol string,
+	internalPort uint16,
+	internalClient string,
+	enabled bool,
+	description string,
+	leaseDuration uint32,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if contextual, ok := client.(contextPortMapper); ok {
+		return contextual.AddPortMappingCtx(ctx, remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration)
+	}
+	return client.AddPortMapping(remoteHost, externalPort, protocol, internalPort, internalClient, enabled, description, leaseDuration)
+}
+
+// GetExternalIPAddress queries the gateway using the context-aware method when available.
+func GetExternalIPAddress(ctx context.Context, client ConnectionClient) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if contextual, ok := client.(contextAddressGetter); ok {
+		return contextual.GetExternalIPAddressCtx(ctx)
+	}
+	return client.GetExternalIPAddress()
+}
+
 func GetGatewayClients(ctx context.Context) []Gateway {
 	clients := GetConnectionClients(ctx)
 	gatewayClients := make([]Gateway, len(clients))
@@ -56,7 +107,7 @@ func GetGatewayClients(ctx context.Context) []Gateway {
 
 // Gather UPNPConnectionClients in the network and treats errors as non-critical. Use this to find out the external IPs of the network and configure port forwarding
 func GetConnectionClients(ctx context.Context) []ConnectionClient {
-	tasks, _ := errgroup.WithContext(ctx)
+	var tasks errgroup.Group
 	// This code sucks and I did not manage to make it more concise.
 	//Turns out using []*type instead of []type prevents you from casting to an interface.
 	// If you have any better ideas please take a stab at it.
@@ -64,21 +115,21 @@ func GetConnectionClients(ctx context.Context) []ConnectionClient {
 	var ip1Error []error
 	tasks.Go(func() error {
 		var err error
-		ip1Clients, ip1Error, err = internetgateway2.NewWANIPConnection1Clients()
+		ip1Clients, ip1Error, err = internetgateway2.NewWANIPConnection1ClientsCtx(ctx)
 		return err
 	})
 	var ip2Clients []*internetgateway2.WANIPConnection2
 	var ip2Error []error
 	tasks.Go(func() error {
 		var err error
-		ip2Clients, ip2Error, err = internetgateway2.NewWANIPConnection2Clients()
+		ip2Clients, ip2Error, err = internetgateway2.NewWANIPConnection2ClientsCtx(ctx)
 		return err
 	})
 	var ppp1Clients []*internetgateway2.WANPPPConnection1
 	var ppp1Error []error
 	tasks.Go(func() error {
 		var err error
-		ppp1Clients, ppp1Error, err = internetgateway2.NewWANPPPConnection1Clients()
+		ppp1Clients, ppp1Error, err = internetgateway2.NewWANPPPConnection1ClientsCtx(ctx)
 		return err
 	})
 

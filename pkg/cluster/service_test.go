@@ -2,22 +2,36 @@ package cluster_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kube-vip/kube-vip/pkg/arp"
+	"github.com/kube-vip/kube-vip/pkg/bgp"
 	"github.com/kube-vip/kube-vip/pkg/cluster"
+	"github.com/kube-vip/kube-vip/pkg/election"
 	"github.com/kube-vip/kube-vip/pkg/kubevip"
 	"github.com/kube-vip/kube-vip/pkg/route"
 	"github.com/kube-vip/kube-vip/pkg/vip"
 	"github.com/vishvananda/netlink"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const testCIDR = "10.0.0.34/32"
@@ -28,10 +42,181 @@ func TestBGPHealthCheckLoop_AnnouncesOnHealthy(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	startVipService(t, newTestConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
+	startVipService(t, newBGPConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
 
 	expectEventually(t, func() bool { return bgpManager.isAnnounced() },
 		"route should be announced")
+}
+
+func TestServicesWorkerStopAndWaitDrainsBeforeRestart(t *testing.T) {
+	config := &kubevip.Config{}
+	serviceCluster, err := cluster.InitCluster(config, true, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("InitCluster() error = %v", err)
+	}
+	var workers sync.WaitGroup
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err != nil {
+		t.Fatalf("first StartLoadBalancerService() error = %v", err)
+	}
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err == nil {
+		t.Fatal("second StartLoadBalancerService() started while the first workers were active")
+	}
+
+	serviceCluster.StopAndWait()
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err != nil {
+		t.Fatalf("StartLoadBalancerService() after StopAndWait error = %v", err)
+	}
+	serviceCluster.StopAndWait()
+	workers.Wait()
+}
+
+func TestServicesWorkerStopAndWaitPreservingDrainsBeforeRestart(t *testing.T) {
+	config := &kubevip.Config{}
+	serviceCluster, err := cluster.InitCluster(config, true, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("InitCluster() error = %v", err)
+	}
+	var workers sync.WaitGroup
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err != nil {
+		t.Fatalf("StartLoadBalancerService() error = %v", err)
+	}
+	serviceCluster.StopAndWait()
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err != nil {
+		t.Fatalf("StartLoadBalancerService() after preserving stop error = %v", err)
+	}
+	serviceCluster.StopAndWait()
+	workers.Wait()
+}
+
+func TestServicesWorkerStopRemovesVIPUnlessPreserved(t *testing.T) {
+	tests := []struct {
+		name     string
+		arp      bool
+		preserve bool
+	}{
+		{name: "stop removes the VIP"},
+		{name: "stop with ARP removes the VIP", arp: true},
+		{name: "preserving stop keeps the VIP", preserve: true},
+		{name: "preserving stop with ARP keeps the VIP", arp: true, preserve: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := &kubevip.Config{EnableARP: test.arp, ArpBroadcastRate: 3000, VIPSubnet: "32"}
+			network := &mockNetwork{ip: "192.0.2.10", cidr: "192.0.2.10/32"}
+			var arpMgr *arp.Manager
+			if test.arp {
+				arpMgr = arp.NewManager(config)
+				if test.preserve {
+					// A preserved VIP is shared, so the sibling Service still holds an ARP claim.
+					arpMgr.Insert(arp.NewInstance(network, nil))
+				}
+			}
+			serviceCluster, err := cluster.InitCluster(config, true, nil, arpMgr, nil, nil)
+			if err != nil {
+				t.Fatalf("InitCluster() error = %v", err)
+			}
+			serviceCluster.Network = []vip.Network{network}
+
+			var workers sync.WaitGroup
+			if err := serviceCluster.StartLoadBalancerService(context.Background(), config, nil, "service", &workers); err != nil {
+				t.Fatalf("StartLoadBalancerService() error = %v", err)
+			}
+			if !network.isPresent() {
+				t.Fatal("VIP was not added when the Service worker started")
+			}
+
+			if test.preserve {
+				serviceCluster.StopAndWaitPreserving(network.IP())
+			} else {
+				serviceCluster.StopAndWait()
+			}
+			workers.Wait()
+
+			if got := network.isPresent(); got != test.preserve {
+				t.Fatalf("VIP present after stop = %t, want %t", got, test.preserve)
+			}
+		})
+	}
+}
+
+func TestStartLoadBalancerServiceRollsBackEarlierNetwork(t *testing.T) {
+	first := &mockNetwork{ip: "192.0.2.10", cidr: "192.0.2.10/32"}
+	second := &mockNetwork{ip: "192.0.2.11", cidr: "192.0.2.11/32", setMaskErr: errors.New("set mask")}
+	serviceCluster, err := cluster.InitCluster(&kubevip.Config{}, true, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("InitCluster() error = %v", err)
+	}
+	serviceCluster.Network = []vip.Network{first, second}
+
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), &kubevip.Config{VIPSubnet: "32"}, nil, "service", &sync.WaitGroup{}); err == nil {
+		t.Fatal("StartLoadBalancerService() error = nil, want second-network failure")
+	}
+	first.mu.Lock()
+	addCalls, deleteCalls, present := first.addIPCalls, first.deleteIPCalls, first.present
+	first.mu.Unlock()
+	if addCalls != 1 || deleteCalls != 1 || present {
+		t.Fatalf("first network rollback = add %d, delete %d, present %t; want 1, 1, false", addCalls, deleteCalls, present)
+	}
+	serviceCluster.StopAndWait()
+}
+
+func TestStartLoadBalancerServiceRollbackPreservesExistingVIP(t *testing.T) {
+	first := &mockNetwork{ip: "192.0.2.10", cidr: "192.0.2.10/32", present: true}
+	second := &mockNetwork{ip: "192.0.2.11", cidr: "192.0.2.11/32", setMaskErr: errors.New("set mask")}
+	serviceCluster, err := cluster.InitCluster(&kubevip.Config{}, true, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("InitCluster() error = %v", err)
+	}
+	serviceCluster.Network = []vip.Network{first, second}
+
+	if err := serviceCluster.StartLoadBalancerService(context.Background(), &kubevip.Config{VIPSubnet: "32"}, nil, "service", &sync.WaitGroup{}); err == nil {
+		t.Fatal("StartLoadBalancerService() error = nil, want second-network failure")
+	}
+	first.mu.Lock()
+	addCalls, deleteCalls, present := first.addIPCalls, first.deleteIPCalls, first.present
+	first.mu.Unlock()
+	if addCalls != 1 || deleteCalls != 0 || !present {
+		t.Fatalf("existing VIP rollback = add %d, delete %d, present %t; want 1, 0, true", addCalls, deleteCalls, present)
+	}
+	serviceCluster.StopAndWait()
+}
+
+func TestStartLoadBalancerServiceCancelledContextDoesNotConfigureVIP(t *testing.T) {
+	network := &mockNetwork{ip: "192.0.2.10", cidr: "192.0.2.10/32"}
+	serviceCluster, err := cluster.InitCluster(&kubevip.Config{}, true, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("InitCluster() error = %v", err)
+	}
+	serviceCluster.Network = []vip.Network{network}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = serviceCluster.StartLoadBalancerService(ctx, &kubevip.Config{VIPSubnet: "32"}, nil, "service", &sync.WaitGroup{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartLoadBalancerService() error = %v, want context.Canceled", err)
+	}
+	network.mu.Lock()
+	addCalls := network.addIPCalls
+	network.mu.Unlock()
+	if addCalls != 0 {
+		t.Fatalf("AddIP calls = %d, want 0 after context cancellation", addCalls)
+	}
+}
+
+func TestBGPHealthCheckLoop_UsesClientCertificate(t *testing.T) {
+	t.Parallel()
+	healthcheck := newMutualTLSHealthServer(t, http.StatusOK)
+	t.Cleanup(healthcheck.server.Close)
+	certPath, keyPath := writeClientCertificate(t)
+
+	config := newBGPConfig(healthcheck.server.URL, healthcheck.caPath)
+	config.ControlPlaneHealthCheck.ClientCertPath = certPath
+	config.ControlPlaneHealthCheck.ClientKeyPath = keyPath
+	bgpManager := newMockBGPRouteManager()
+	startVipService(t, config, bgpManager)
+
+	expectEventually(t, func() bool { return bgpManager.isAnnounced() },
+		"route should be announced when mutual TLS health check succeeds")
 }
 
 func TestBGPHealthCheckLoop_NoAnnouncementUntilHealthy(t *testing.T) {
@@ -40,7 +225,7 @@ func TestBGPHealthCheckLoop_NoAnnouncementUntilHealthy(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	startVipService(t, newTestConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
+	startVipService(t, newBGPConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
 
 	expectConsistently(t, func() bool { return !bgpManager.isAnnounced() },
 		2*time.Second, "route should not be announced while unhealthy")
@@ -56,7 +241,7 @@ func TestBGPHealthCheckLoop_WithdrawsAfterThreshold(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	cfg := newTestConfig(healthcheck.server.URL, healthcheck.caPath)
+	cfg := newBGPConfig(healthcheck.server.URL, healthcheck.caPath)
 	cfg.ControlPlaneHealthCheck.FailureThreshold = 3
 	startVipService(t, cfg, bgpManager)
 
@@ -78,7 +263,7 @@ func TestBGPHealthCheckLoop_ReAnnouncesOnRecovery(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	cfg := newTestConfig(healthcheck.server.URL, healthcheck.caPath)
+	cfg := newBGPConfig(healthcheck.server.URL, healthcheck.caPath)
 	cfg.ControlPlaneHealthCheck.FailureThreshold = 1
 	startVipService(t, cfg, bgpManager)
 
@@ -100,7 +285,7 @@ func TestBGPHealthCheckLoop_StopsOnContextCancel(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	cancelContext, vipServiceDone := startVipService(t, newTestConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
+	cancelContext, vipServiceDone := startVipService(t, newBGPConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
 
 	expectEventually(t, func() bool { return bgpManager.isAnnounced() },
 		"route should be announced")
@@ -121,7 +306,7 @@ func TestBGPHealthCheckLoop_RetriesAddHostOnFailure(t *testing.T) {
 
 	bgpManager := newMockBGPRouteManager()
 	bgpManager.setAddErr(errTestAddHost)
-	startVipService(t, newTestConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
+	startVipService(t, newBGPConfig(healthcheck.server.URL, healthcheck.caPath), bgpManager)
 
 	expectConsistently(t, func() bool { return !bgpManager.isAnnounced() },
 		2*time.Second, "route should not be announced while AddHost errors")
@@ -137,7 +322,7 @@ func TestBGPHealthCheckLoop_RetriesDelHostOnFailure(t *testing.T) {
 	t.Cleanup(healthcheck.server.Close)
 
 	bgpManager := newMockBGPRouteManager()
-	cfg := newTestConfig(healthcheck.server.URL, healthcheck.caPath)
+	cfg := newBGPConfig(healthcheck.server.URL, healthcheck.caPath)
 	cfg.ControlPlaneHealthCheck.FailureThreshold = 1
 	startVipService(t, cfg, bgpManager)
 
@@ -153,6 +338,101 @@ func TestBGPHealthCheckLoop_RetriesDelHostOnFailure(t *testing.T) {
 	bgpManager.setDelErr(nil)
 	expectEventually(t, func() bool { return !bgpManager.isAnnounced() },
 		"route should be withdrawn after clearing DelHost error")
+}
+
+func TestBGPHealthCheckLoop_GateVIPAddsVIPBeforeAnnouncing(t *testing.T) {
+	t.Parallel()
+	healthcheck := newTestHealthServer(t, http.StatusServiceUnavailable)
+	t.Cleanup(healthcheck.server.Close)
+
+	bgpManager := newMockBGPRouteManager()
+	network := &mockNetwork{ip: "10.0.0.1", cidr: testCIDR}
+	network.setAddIPErr(errTestAddIP)
+	cancelContext, vipServiceDone := startVipServiceWithNetwork(t, newGateVIPConfig(healthcheck), bgpManager, network)
+
+	expectConsistently(t, func() bool { return network.addIPCount() == 0 && !bgpManager.isAnnounced() },
+		1500*time.Millisecond, "VIP should not be added while unhealthy")
+
+	healthcheck.setStatus(http.StatusOK)
+	expectEventually(t, func() bool { return network.addIPCount() > 0 },
+		"VIP should be added once healthy")
+	expectConsistently(t, func() bool { return !bgpManager.isAnnounced() },
+		1500*time.Millisecond, "route should not be announced while AddIP errors")
+
+	network.setAddIPErr(nil)
+	expectEventually(t, func() bool { return network.isPresent() && bgpManager.isAnnounced() },
+		"VIP should be added and route announced after clearing AddIP error")
+
+	cancelContext()
+	<-vipServiceDone
+	if bgpManager.isAnnounced() || !network.isPresent() {
+		t.Fatal("shutdown should withdraw the route and keep the VIP")
+	}
+}
+
+func TestBGPHealthCheckLoop_GateVIPRemovesVIPOnlyAfterWithdrawingRoute(t *testing.T) {
+	t.Parallel()
+	healthcheck := newTestHealthServer(t, http.StatusOK)
+	t.Cleanup(healthcheck.server.Close)
+
+	bgpManager := newMockBGPRouteManager()
+	network := &mockNetwork{ip: "10.0.0.1", cidr: testCIDR}
+	startVipServiceWithNetwork(t, newGateVIPConfig(healthcheck), bgpManager, network)
+
+	expectEventually(t, func() bool { return network.isPresent() && bgpManager.isAnnounced() },
+		"VIP should be added and route announced")
+
+	bgpManager.setDelErr(errTestDelHost)
+	healthcheck.setStatus(http.StatusServiceUnavailable)
+
+	expectConsistently(t, func() bool { return network.isPresent() },
+		1500*time.Millisecond, "VIP should stay while DelHost errors")
+
+	bgpManager.setDelErr(nil)
+	expectEventually(t, func() bool { return !bgpManager.isAnnounced() && !network.isPresent() },
+		"route should be withdrawn and VIP removed after clearing DelHost error")
+}
+
+func TestBGPHealthCheckLoop_GateVIPRemovesStaleVIPOnFirstFailure(t *testing.T) {
+	t.Parallel()
+	healthcheck := newTestHealthServer(t, http.StatusServiceUnavailable)
+	t.Cleanup(healthcheck.server.Close)
+
+	bgpManager := newMockBGPRouteManager()
+	// Left on the interface by a previous run.
+	network := &mockNetwork{ip: "10.0.0.1", cidr: testCIDR, present: true}
+	cfg := newGateVIPConfig(healthcheck)
+	// Only the first check runs during the test, and it must not wait for the threshold.
+	cfg.ControlPlaneHealthCheck.PeriodSeconds = 60
+	cfg.ControlPlaneHealthCheck.FailureThreshold = 3
+	startVipServiceWithNetwork(t, cfg, bgpManager, network)
+
+	expectEventually(t, func() bool { return !network.isPresent() },
+		"stale VIP should be removed on the first failed check")
+}
+
+func TestBGPHealthCheckLoop_GateVIPKeepsVIPWhenShutdownInterruptsCheck(t *testing.T) {
+	t.Parallel()
+	// The server never answers, so the check is still in flight when we cancel.
+	checking := make(chan struct{}, 1)
+	healthcheck := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		checking <- struct{}{}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(healthcheck.Close)
+
+	cfg := newBGPConfig(healthcheck.URL, "")
+	cfg.ControlPlaneHealthCheck.GateVIP = true
+	// Left on the interface by a previous run. A failed check would remove it.
+	network := &mockNetwork{ip: "10.0.0.1", cidr: testCIDR, present: true}
+	cancelContext, vipServiceDone := startVipServiceWithNetwork(t, cfg, newMockBGPRouteManager(), network)
+
+	<-checking
+	cancelContext()
+	<-vipServiceDone
+	if !network.isPresent() {
+		t.Fatal("shutdown should keep the VIP")
+	}
 }
 
 func TestRoutingTableHealthCheck_AddsVIPWhenHealthy(t *testing.T) {
@@ -183,9 +463,190 @@ func TestRoutingTableHealthCheck_RemovesVIPWhenUnhealthy(t *testing.T) {
 		"VIP should be removed once health check becomes unhealthy")
 }
 
+func TestRoutingTableHealthCheck_AddsIPv6VIPWithIPv4HealthCheckURL(t *testing.T) {
+	t.Parallel()
+	healthcheck := newTestHealthServer(t, http.StatusOK)
+	t.Cleanup(healthcheck.server.Close)
+
+	// The health-check URL is IPv4 (127.0.0.1) while the VIP is IPv6; guards against the IPv6 VIP being skipped.
+	network := &mockNetwork{ip: "fd00::1", cidr: "fd00::1/128"}
+	startRoutingTableVipService(t, newRoutingTableConfig(healthcheck.server.URL, healthcheck.caPath), network)
+
+	expectEventually(t, network.isPresent,
+		"IPv6 VIP should be added when the IPv4 health-check URL is healthy")
+}
+
+func TestRoutingTableHealthCheck_HTTPTakesPrecedenceOverKubernetesAddr(t *testing.T) {
+	t.Parallel()
+	healthcheck := newTestHealthServer(t, http.StatusOK)
+	t.Cleanup(healthcheck.server.Close)
+
+	// When both are set, the HTTP check must drive the VIP; KubernetesAddr points at a closed port and would never report healthy.
+	cfg := newRoutingTableConfig(healthcheck.server.URL, healthcheck.caPath)
+	cfg.KubernetesAddr = "127.0.0.1:1"
+
+	network := &mockNetwork{ip: "10.0.0.1", cidr: testCIDR}
+	startRoutingTableVipService(t, cfg, network)
+
+	expectEventually(t, network.isPresent,
+		"VIP should be added because the HTTP health check is healthy, even though KubernetesAddr is set")
+
+	healthcheck.setStatus(http.StatusServiceUnavailable)
+	expectEventually(t, func() bool { return !network.isPresent() },
+		"VIP should be removed once the HTTP health check becomes unhealthy")
+}
+
+func TestRoutingTableInvalidHTTPHealthCheckAddressKillsWithoutFallback(t *testing.T) {
+	t.Parallel()
+	// An invalid ControlPlaneHealthCheck.Address must call killFunc and return an error instead of falling back to KubernetesAddr.
+	cfg := &kubevip.Config{
+		EnableRoutingTable:         true,
+		BackendHealthCheckInterval: 1,
+		KubernetesAddr:             "127.0.0.1:6443",
+		ControlPlaneHealthCheck:    kubevip.HealthCheck{Address: "://bad"},
+	}
+	c, err := cluster.InitCluster(cfg, true, nil, nil, route.NewManager(), nil)
+	if err != nil {
+		t.Fatalf("InitCluster: %v", err)
+	}
+	c.Network = []vip.Network{&mockNetwork{ip: "10.0.0.1", cidr: testCIDR}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killCalls atomic.Int32
+	killFunc := func() {
+		killCalls.Add(1)
+		cancel()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.StartVipService(ctx, cfg, nil, nil, killFunc)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "failed to create HTTP backend") {
+			t.Fatalf("StartVipService() error = %v, want \"failed to create HTTP backend\"", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartVipService did not return after an invalid HTTP health-check address")
+	}
+
+	if killCalls.Load() == 0 {
+		t.Fatal("killFunc was not called for an invalid HTTP health-check address")
+	}
+}
+
+func TestRoutingTableInvalidKubernetesAddrFallsBack(t *testing.T) {
+	t.Parallel()
+	// An unparsable KubernetesAddr must be logged and fall back to node/localhost addresses instead of returning an error.
+	cfg := &kubevip.Config{EnableRoutingTable: true, BackendHealthCheckInterval: 1, KubernetesAddr: "://not-a-url"}
+	c, err := cluster.InitCluster(cfg, true, nil, nil, route.NewManager(), nil)
+	if err != nil {
+		t.Fatalf("InitCluster: %v", err)
+	}
+	c.Network = []vip.Network{&mockNetwork{ip: "10.0.0.1", cidr: testCIDR}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.StartVipService(ctx, cfg, nil, nil, func() {})
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("StartVipService returned early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("StartVipService() error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartVipService did not stop after context cancellation")
+	}
+}
+
+func TestRoutingTableInvalidNodeAddressFallsBackToLocalhost(t *testing.T) {
+	t.Parallel()
+	// A node InternalIP that backend.New rejects (zoned IPv6 "fe80::1%eth0") must be logged and
+	// skipped, not treated as fatal. When no node address is usable, StartVipService falls back to
+	// a localhost backend and keeps running: it must not return or call killFunc until ctx is cancelled.
+	const nodeName = "test-node"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/nodes/"+nodeName {
+			http.NotFound(w, r)
+			return
+		}
+		node := corev1.Node{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Node"},
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+			Status: corev1.NodeStatus{
+				Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "fe80::1%eth0"}},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(node)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("kubernetes.NewForConfig: %v", err)
+	}
+	em := &election.Manager{KubernetesClient: client}
+
+	cfg := &kubevip.Config{EnableRoutingTable: true, BackendHealthCheckInterval: 1, NodeName: nodeName}
+	c, err := cluster.InitCluster(cfg, true, nil, nil, route.NewManager(), nil)
+	if err != nil {
+		t.Fatalf("InitCluster: %v", err)
+	}
+	c.Network = []vip.Network{&mockNetwork{ip: "10.0.0.1", cidr: testCIDR}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killCalls atomic.Int32
+	killFunc := func() {
+		killCalls.Add(1)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.StartVipService(ctx, cfg, em, nil, killFunc)
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("StartVipService returned early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	if n := killCalls.Load(); n != 0 {
+		t.Fatalf("killFunc was called %d time(s), want 0 for invalid node address with localhost fallback", n)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("StartVipService() error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartVipService did not stop after context cancellation")
+	}
+}
+
 var (
 	errTestAddHost = &testError{msg: "mock AddHost error"}
 	errTestDelHost = &testError{msg: "mock DelHost error"}
+	errTestAddIP   = &testError{msg: "mock AddIP error"}
 )
 
 type testError struct{ msg string }
@@ -195,20 +656,24 @@ func (e *testError) Error() string { return e.msg }
 // startVipService launches vipService in a goroutine with a mock network and
 // registers a cleanup to cancel the context and wait for it to finish.
 // Uses InitCluster so the real code parses certs for the BGP health check client.
-func startVipService(t *testing.T, cfg *kubevip.Config, bgpManager *mockBGPRouteManager) (context.CancelFunc, <-chan struct{}) {
+func startVipService(t *testing.T, cfg *kubevip.Config, bgpServer bgp.BGPManager) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
+	return startVipServiceWithNetwork(t, cfg, bgpServer, &mockNetwork{ip: "10.0.0.1", cidr: testCIDR})
+}
 
+func startVipServiceWithNetwork(t *testing.T, cfg *kubevip.Config, bgpServer bgp.BGPManager, network *mockNetwork) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
 	c, err := cluster.InitCluster(cfg, true, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("InitCluster: %v", err)
 	}
-	c.Network = []vip.Network{&mockNetwork{ip: "10.0.0.1", cidr: testCIDR}}
+	c.Network = []vip.Network{network}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 
 	go func() {
-		_ = c.StartVipService(ctx, cfg, nil, bgpManager, func() {})
+		_ = c.StartVipService(ctx, cfg, nil, bgpServer, func() {})
 		close(done)
 	}()
 
@@ -247,14 +712,14 @@ func startRoutingTableVipService(t *testing.T, cfg *kubevip.Config, network *moc
 }
 
 func newRoutingTableConfig(url, caPath string) *kubevip.Config {
-	cfg := newTestConfig(url, caPath)
+	cfg := newBGPConfig(url, caPath)
 	cfg.EnableBGP = false
 	cfg.EnableRoutingTable = true
 	cfg.BackendHealthCheckInterval = 1
 	return cfg
 }
 
-func newTestConfig(url, caPath string) *kubevip.Config {
+func newBGPConfig(url, caPath string) *kubevip.Config {
 	return &kubevip.Config{
 		EnableBGP: true,
 		ControlPlaneHealthCheck: kubevip.HealthCheck{
@@ -323,32 +788,63 @@ type mockNetwork struct {
 	ip   string
 	cidr string
 
-	mu      sync.Mutex
-	present bool
+	mu            sync.Mutex
+	present       bool
+	setMaskErr    error
+	addIPErr      error
+	addIPCalls    int
+	deleteIPCalls int
 }
 
 func (m *mockNetwork) AddIP(bool, bool, ...int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addIPCalls++
+	if m.addIPErr != nil {
+		return false, m.addIPErr
+	}
 	m.present = true
 	return true, nil
 }
+
+func (m *mockNetwork) addIPCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.addIPCalls
+}
+
+func (m *mockNetwork) setAddIPErr(err error) {
+	m.mu.Lock()
+	m.addIPErr = err
+	m.mu.Unlock()
+}
+
 func (m *mockNetwork) DeleteIP() (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.deleteIPCalls++
+	deleted := m.present
 	m.present = false
-	return false, nil
+	return deleted, nil
 }
+
 func (m *mockNetwork) isPresent() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.present
 }
-func (m *mockNetwork) AddRoute(bool) (bool, error)     { return false, nil }
-func (m *mockNetwork) ReplaceRoute() error             { return nil }
-func (m *mockNetwork) DeleteRoute() error              { return nil }
-func (m *mockNetwork) UpdateRoutes() (bool, error)     { return false, nil }
-func (m *mockNetwork) IsSet() (*netlink.Addr, error)   { return nil, nil }
+func (m *mockNetwork) AddRoute(bool) (bool, error) { return false, nil }
+func (m *mockNetwork) ReplaceRoute() error         { return nil }
+func (m *mockNetwork) DeleteRoute() error          { return nil }
+func (m *mockNetwork) UpdateRoutes() (bool, error) { return false, nil }
+func (m *mockNetwork) IsSet() (*netlink.Addr, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.present {
+		return &netlink.Addr{}, nil
+	}
+	return nil, nil
+}
 func (m *mockNetwork) IP() string                      { return m.ip }
 func (m *mockNetwork) CIDR() string                    { return m.cidr }
 func (m *mockNetwork) IPisLinkLocal() bool             { return false }
@@ -362,7 +858,7 @@ func (m *mockNetwork) IsDNS() bool                     { return false }
 func (m *mockNetwork) IsDDNS() bool                    { return false }
 func (m *mockNetwork) DDNSHostName() string            { return "" }
 func (m *mockNetwork) DNSName() string                 { return "" }
-func (m *mockNetwork) SetMask(string) error            { return nil }
+func (m *mockNetwork) SetMask(string) error            { return m.setMaskErr }
 func (m *mockNetwork) SetHasEndpoints(bool)            {}
 func (m *mockNetwork) HasEndpoints() bool              { return false }
 func (m *mockNetwork) ARPName() string                 { return "" }
@@ -399,6 +895,58 @@ func newTestHealthServer(t *testing.T, status int) *testHealthServer {
 	return healthcheck
 }
 
+func newMutualTLSHealthServer(t *testing.T, status int) *testHealthServer {
+	t.Helper()
+	healthcheck := &testHealthServer{}
+	healthcheck.statusCode.Store(int64(status))
+	healthcheck.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(healthcheck.statusCode.Load()))
+	}))
+	healthcheck.server.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS12}
+	healthcheck.server.StartTLS()
+
+	cert := healthcheck.server.Certificate()
+	if cert == nil {
+		t.Fatal("TLS server has no certificate")
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	healthcheck.caPath = caFile
+	return healthcheck
+}
+
+func writeClientCertificate(t *testing.T) (string, string) {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	certPath := filepath.Join(directory, "client.crt")
+	keyPath := filepath.Join(directory, "client.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
+
 func (ths *testHealthServer) setStatus(code int) {
 	ths.statusCode.Store(int64(code))
 }
@@ -427,4 +975,10 @@ func expectEventually(t *testing.T, condition func() bool, msg string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("timeout: %s", msg)
+}
+
+func newGateVIPConfig(healthcheck *testHealthServer) *kubevip.Config {
+	cfg := newBGPConfig(healthcheck.server.URL, healthcheck.caPath)
+	cfg.ControlPlaneHealthCheck.GateVIP = true
+	return cfg
 }
